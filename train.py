@@ -10,7 +10,7 @@ import os
 DO_WANDB = True
 
 if DO_WANDB:
-    import wandb  # Added wandb import
+    import wandb  # wandb import
 
 def get_transforms():
     train_transform = transforms.Compose([
@@ -75,12 +75,10 @@ def train_one_epoch(model, loader, optimizer, epoch,
         
         # Calculate losses
         task_loss = criterion(logits, targets)
-        sparsity_loss = model.get_sparsity_loss(masks)
-        binary_loss = model.get_binary_regularization(masks)
+        sparsity_loss = model.get_sparsity_loss(masks) * sparsity_weight
+        binary_loss = model.get_binary_regularization(masks) * binary_weight
         
-        loss = task_loss + \
-               sparsity_loss + \
-               binary_loss
+        loss = task_loss + sparsity_loss + binary_loss
         
         loss.backward()
         optimizer.step()
@@ -96,22 +94,18 @@ def train_one_epoch(model, loader, optimizer, epoch,
             accuracy = (preds == targets).float().mean().item()
             selection_rate = (masks > 0.5).float().mean().item()
             
-            # Update running totals
             accuracy_total += accuracy
             selection_rate_total += selection_rate
         
-        
-        # Visualize every n steps
         if batch_idx % viz_every_n_steps == 0:
             with torch.no_grad():
-                for i in range(min(5, len(images))):  # Just show 2 images
+                for i in range(min(5, len(images))):
                     viz_path = f'viz/step_{epoch}_{batch_idx}_sample_{i}.png'
                     visualize_masks(
                         images[i].cpu(), 
                         masks[i].cpu(),
                         save_path=viz_path
                     )
-                    # Log the visualization image to wandb
                     if DO_WANDB:
                         wandb.log({f"Sample_{i}": wandb.Image(viz_path)}, step=step)
         
@@ -125,9 +119,9 @@ def train_one_epoch(model, loader, optimizer, epoch,
         if DO_WANDB:
             wandb.log({
                 'train/loss': loss.item(),
-                'train/task_loss': task_loss,
-                'train/sparsity_loss': sparsity_loss,
-                'train/binary_loss': binary_loss,
+                'train/task_loss': task_loss.item(),
+                'train/sparsity_loss': sparsity_loss.item(),
+                'train/binary_loss': binary_loss.item(),
                 'train/accuracy': accuracy,
                 'train/selection_rate': selection_rate,
                 'train/step': step
@@ -144,7 +138,7 @@ def train_one_epoch(model, loader, optimizer, epoch,
         wandb.log({f"train/epoch_{epoch}_metrics": epoch_metrics})
     return epoch_metrics, step
 
-@torch.no_grad()  # Make sure we don't track gradients during validation
+@torch.no_grad()
 def validate(model, val_loader, device):
     model.eval()
     total_correct = 0
@@ -154,20 +148,20 @@ def validate(model, val_loader, device):
     
     for images, targets in tqdm(val_loader, desc='Validation'):
         images, targets = images.to(device), targets.to(device)
-        B = targets.size(0)  # Batch size
+        B = targets.size(0)
         
-        # Get logits (in eval mode, does actual truncation)
+        # Get logits in eval mode (actual truncation)
         logits = model(images)
         
-        # Calculate top-1 accuracy
+        # top-1 accuracy
         preds = logits.argmax(dim=1)
         total_correct += (preds == targets).sum().item()
         
-        # Calculate top-5 accuracy
+        # top-5 accuracy
         _, top5_preds = logits.topk(5, dim=1)
         top5_correct += torch.any(top5_preds == targets.view(-1, 1), dim=1).sum().item()
         
-        # For selection rate, we need to temporarily switch to train mode
+        # For selection rate, temporarily switch to training mode to get masks
         model.train()
         _, masks = model(images)
         model.eval()
@@ -180,7 +174,6 @@ def validate(model, val_loader, device):
         'val_top5_accuracy': top5_correct / total_samples,
         'val_selection_rate': total_selection_rate / total_samples
     }
-    
     return metrics
 
 def main():
@@ -188,7 +181,6 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     train_transform, val_transform = get_transforms()
     
-    # Initialize wandb
     if DO_WANDB:
         wandb.init(project="sparsefudge", config={
             "epochs": 10,
@@ -209,38 +201,30 @@ def main():
     # Create model
     model = SparseViT(num_classes=1000, temperature=1.0).to(device)
     optimizer = AdamW(model.parameters(), lr=3e-4)
+    
     os.makedirs('viz', exist_ok=True)
-    # Train loop
     num_epochs = 10
     step = 0
     for epoch in range(num_epochs):
         metrics, step = train_one_epoch(
             model, train_loader, optimizer, epoch,
-            viz_every_n_steps=1000,  # Visualize every 100 steps,
-            step=step
+            viz_every_n_steps=1000,
+            step=step,
+            device=device
         )
         print(f"Epoch {epoch} metrics:", metrics)
 
         val_metrics = validate(model, val_loader, device)
         print(f"Epoch {epoch} validation metrics:", val_metrics)
-
-        val_metrics = validate(model, val_loader, device)
-        print(f"Epoch {epoch} metrics:")
-        print(f"Val:", val_metrics)
         
         if DO_WANDB:
             wandb.log({
-                # Training metrics (assuming they're returned as a dict
-                # Validation metrics
                 'val/accuracy': val_metrics['val_accuracy'],
                 'val/top5_accuracy': val_metrics['val_top5_accuracy'],
                 'val/selection_rate': val_metrics['val_selection_rate'],
-                
-                # General
                 'epoch': epoch,
             })
 
-        
         # Save checkpoint
         if epoch % 5 == 0:
             checkpoint = {
@@ -250,7 +234,7 @@ def main():
                 'metrics': metrics,
             }
             torch.save(checkpoint, f'checkpoint_epoch_{epoch}.pt')
-            #wandb.save(f'checkpoint_epoch_{epoch}.pt')
+            # wandb.save(f'checkpoint_epoch_{epoch}.pt')
             
         # Visualize some examples on validation set
         if epoch % 2 == 0:
@@ -259,7 +243,6 @@ def main():
                 images, _ = next(iter(val_loader))
                 images = images.to(device)
                 _, masks = model(images)
-                
                 for i in range(min(5, len(images))):
                     viz_path = f'viz_epoch_{epoch}_sample_{i}.png'
                     visualize_masks(
