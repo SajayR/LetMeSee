@@ -3,47 +3,101 @@ import torch.nn as nn
 import timm
 from torchvision import transforms
 
-class TokenSelector(nn.Module):
+'''class TokenSelector(nn.Module):
     """
-    A token selector that takes in patch embeddings of shape [B, N, *]
-    and outputs soft or hard masks of shape [B, N, 1].
-    
-    Now it expects the patch embeddings to have shape [B, N, 2D]
-    if we concatenate the mean vector and the patch embedding.
+    Token selector with a single self-attention layer.
+    Removes previous mean concat; each token can now attend
+    to all other tokens before producing a binary mask.
     """
-    def __init__(self, in_dim, temperature=1.0):
+    def __init__(self, embed_dim, temperature=1.0, num_heads=1):
         """
         Args:
-            in_dim (int): Dimensionality of token selector input
-                          (in our updated design, this may be 2*embed_dim 
-                          if we concatenate patch embedding + mean embedding).
-            temperature (float): Temperature factor for the sigmoid.
+            embed_dim (int): Dimension of the patch embeddings.
+            temperature (float): Temperature factor for sigmoid.
+            num_heads (int): Number of attention heads to use.
         """
         super().__init__()
         self.temperature = temperature
-        self.logits = nn.Linear(in_dim, 1)  # Projects each token embedding to a scalar
-    
+        
+        # A single self-attention block (scaled dot-product)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(embed_dim)
+        
+        # Linear projection from attended features -> scalar logits
+        self.out_proj = nn.Linear(embed_dim, 1)
+
     def forward(self, x):
-        # x shape: [B, N, in_dim], in_dim may be 2D if using mean+patch concat
-        logits = self.logits(x).squeeze(-1)  # [B, N]
-        probs = torch.sigmoid(logits / self.temperature)  # [B, N]
+        """
+        Args:
+            x: [B, N, D] patch embeddings (already pos-embedded).
+        Returns:
+            A mask of shape [B, N, 1]. Training => soft in [0,1].
+                                       Inference => hard 0/1.
+        """
+        # Self-attention (batch_first=True, so x is [B, N, D])
+        attended, _ = self.attn(x, x, x)
+        
+        # Residual + layer norm
+        x = x + attended
+        x = self.norm(x)
+        
+        # Project to scalar logits => shape [B, N]
+        logits = self.out_proj(x).squeeze(-1)  # [B, N]
+        
+        # Temperature scaling and sigmoid
+        probs = torch.sigmoid(logits / self.temperature)
         
         if self.training:
-            # Return soft masks for training
-            return probs.unsqueeze(-1)  # [B, N, 1]
+            return probs.unsqueeze(-1)  # [B, N, 1] (soft)
         else:
-            # Return hard (0/1) masks for inference
-            return (probs > 0.5).float().unsqueeze(-1)  # [B, N, 1]
+            return (probs > 0.5).float().unsqueeze(-1)  # [B, N, 1] (hard)'''
 
+class TokenSelector(nn.Module):
+    def __init__(self, embed_dim, temperature=1.0, num_heads=8):
+        super().__init__()
+        self.temperature = temperature
+        
+        # Project to larger dim for more expressivity
+        self.expanded_dim = embed_dim * 2
+        self.up_proj = nn.Linear(embed_dim, self.expanded_dim)
+        
+        # Multi-head attention in expanded space
+        self.attn = nn.MultiheadAttention(
+            self.expanded_dim, 
+            num_heads,  # more heads since we have more dim
+            batch_first=True
+        )
+        self.norm = nn.LayerNorm(self.expanded_dim)
+        
+        # Final projection sequence to scalar
+        self.out_proj = nn.Sequential(
+            nn.Linear(self.expanded_dim, self.expanded_dim // 2),
+            nn.GELU(),
+            nn.Linear(self.expanded_dim // 2, 1)
+        )
+
+    def forward(self, x):
+        # Project up to higher dim
+        x = self.up_proj(x)  # [B, N, 2D]
+        
+        # Self-attention in expanded space
+        attended, _ = self.attn(x, x, x)
+        x = x + attended
+        x = self.norm(x)
+        
+        # Project to scalar logits and apply sigmoid
+        logits = self.out_proj(x).squeeze(-1)
+        probs = torch.sigmoid(logits / self.temperature)
+        
+        if self.training:
+            return probs.unsqueeze(-1)  # [B, N, 1] (soft)
+        else:
+            return (probs > 0.5).float().unsqueeze(-1)  # [B, N, 1] (hard)
 
 class SparseViT(nn.Module):
     """
     A Vision Transformer that employs a token selector module for
-    content-aware patch truncation.
-
-    Key fixes in this version:
-      - We only apply positional embeddings once (before masking).
-      - We remove all extra positional-embedding additions in inference.
+    content-aware patch truncation, now with attention-based token selection.
     """
     def __init__(self, 
                  num_classes=1000, 
@@ -55,10 +109,13 @@ class SparseViT(nn.Module):
         self.vit = timm.create_model('vit_base_patch16_224', pretrained=True)
         embed_dim = self.vit.embed_dim  # Typically 768 for vit_base_patch16_224
         
-        # 2) Create the token selector
-        #    We'll pass [patch_embedding, mean_embedding] => total dim = 2*embed_dim
-        self.token_selector = TokenSelector(in_dim=2 * embed_dim, 
-                                            temperature=temperature)
+        # 2) Create the token selector with self-attention
+        #    We no longer do mean-embedding concat, so in_dim = embed_dim
+        self.token_selector = TokenSelector(
+            embed_dim=embed_dim,
+            temperature=temperature,
+            num_heads=8  # Single-headed or could use more heads if desired
+        )
         
         # 3) Additional hyperparameters
         self.sparsity_target = sparsity_target
@@ -66,120 +123,98 @@ class SparseViT(nn.Module):
 
     def get_sparsity_loss(self, masks):
         """
-        L2 penalty that encourages the average activation to match self.sparsity_target.
+        L2-like penalty that encourages the average activation
+        to match self.sparsity_target (currently a simple baseline).
         """
         mean_activation = masks.mean()
-        return mean_activation  # or (mean_activation - self.sparsity_target).pow(2)
-
+        return mean_activation  # Could do (mean_activation - self.sparsity_target).pow(2)
+    
     def get_binary_regularization(self, masks):
-        """
-        Additional penalty for mask values near 0.5.
-        We encourage them to saturate toward 0 or 1.
-        """
-        middle_penalty = -torch.log(torch.abs(masks - 0.5) + 1e-7) * 3.0
-        gray_zone = (masks > 0.05) & (masks < 0.95)
-        gray_penalty = gray_zone.float() * 5.0
-        return middle_penalty.mean() + gray_penalty.mean()
+        # Only apply pressure in the wider middle range (0.01-0.99)
+        active_zone = (masks > 0.01) & (masks < 0.99)
+        middle_dist = torch.abs(masks - 0.5)
+        penalty = active_zone * (-torch.log(middle_dist + 1e-7))**2  # or **3
+        return penalty.mean() * 5.0
 
     def forward(self, x):
         """
         Forward pass:
           1) Patchify input
-          2) Concatenate CLS token + patches
-          3) Add positional embeddings (once!) and do dropout
-          4) Separate out patch tokens from CLS
-          5) Pass patch tokens to the token selector to get a mask
-             - Training: multiply patch embeddings by mask
-             - Inference: gather selected patches
-          6) Pass the resulting tokens through ViT blocks
-          7) Return logits and (optionally) masks
+          2) Concatenate CLS token + patch embeddings
+          3) Add positional embeddings (once!) and apply dropout
+          4) Separate CLS from patch tokens
+          5) Pass patch tokens to the token selector (attn-based)
+          6) Training => soft mask multiplication
+             Inference => gather truncated tokens
+          7) Pass resulting tokens through the ViT blocks, return logits
         """
         B = x.shape[0]
         
-        # === [1] Patchify (backbone's patch_embed) ===
+        # === [1] Patchify ===
         x_patches = self.vit.patch_embed(x)  # [B, N, D]
         
-        # === [2] Concatenate CLS token ===
-        cls_token = self.vit.cls_token.expand(B, -1, -1)  # [B, 1, D]
+        # === [2] CLS token
+        cls_token = self.vit.cls_token.expand(B, -1, -1)
         x_full = torch.cat((cls_token, x_patches), dim=1)  # [B, N+1, D]
         
-        # === [3] Add positional embeddings once, apply dropout ===
-        # Note: self.vit.pos_embed is shape [1, 197, D] (for N=196 + CLS=1).
+        # === [3] Add position embeddings once + dropout
         x_full = x_full + self.vit.pos_embed[:, : x_full.size(1), :]
         x_full = self.vit.pos_drop(x_full)
         
-        # === Separate the CLS and patch tokens ===
+        # Separate out CLS and patch tokens
         cls_only = x_full[:, 0:1, :]   # [B, 1, D]
-        patch_only = x_full[:, 1:, :]  # [B, N, D] (pos-embedded patch tokens)
+        patch_only = x_full[:, 1:, :]  # [B, N, D]
         
-        # === [4] Token selection step ===
-        mean_patch = patch_only.mean(dim=1, keepdim=True)     # [B, 1, D]
-        mean_patch_broadcast = mean_patch.expand(-1, patch_only.shape[1], -1)  # [B, N, D]
-        
-        # Concat original patch embedding + mean patch embedding => shape [B, N, 2D]
-        patch_plus_mean = torch.cat([patch_only, mean_patch_broadcast], dim=-1)
-        
-        # === [5] Forward through the token selector => get mask ===
-        patch_masks = self.token_selector(patch_plus_mean)  # [B, N, 1]
-        
+        # === [4] Attn-based token selection
+        patch_masks = self.token_selector(patch_only)  # shape [B, N, 1]
+
         if self.training:
-            # --- Training mode: soft mask multiplication ---
-            masked_patches = patch_only * patch_masks  # [B, N, D]
+            # Soft mask
+            masked_patches = patch_only * patch_masks
             x_combined = torch.cat([cls_only, masked_patches], dim=1)  # [B, N+1, D]
             
-            # === Pass through ViT blocks ===
+            # Pass through ViT blocks
             for blk in self.vit.blocks:
                 x_combined = blk(x_combined)
             
             x_combined = self.vit.norm(x_combined)
-            logits = self.vit.head(x_combined[:, 0])  # [B, num_classes]
+            logits = self.vit.head(x_combined[:, 0])
             
             return logits, patch_masks
         
         else:
-            # --- Inference mode: actual truncation ---
+            # Hard truncation
             x_out_list = []
-            
             for i in range(B):
-                # 1) Gather the (0/1) mask for sample i => shape [N]
-                sample_mask = patch_masks[i, :, 0]
+                sample_mask = patch_masks[i, :, 0]  # [N]
                 selected_indices = (sample_mask > 0).nonzero(as_tuple=False).squeeze(-1)
                 
-                # 2) Extract patch embeddings (already pos-embedded!) => shape [N, D]
-                sample_patches = patch_only[i]  
+                sample_patches = patch_only[i]  # [N, D] (already pos-embedded)
                 selected_patches = sample_patches[selected_indices]
                 
-                # 3) Combine with CLS token (already pos-embedded!)
-                sample_cls = cls_only[i : i+1, :]  # shape [1, D]
+                sample_cls = cls_only[i : i+1, :].squeeze(1)  # [1, D]
+                #print(sample_cls.shape)
                 
-                # NOTE: We do NOT add positional embeddings again in inference. # CHANGED
-                truncated_tokens = torch.cat(
-                    [sample_cls, selected_patches],
-                    dim=0  # shape [1 + num_selected, D]
-                ).unsqueeze(0)  # => [1, (1+num_selected), D]
+                truncated_tokens = torch.cat([sample_cls, selected_patches], dim=0)
+                truncated_tokens = truncated_tokens.unsqueeze(0)  # [1, num_sel+1, D]
                 
-                # 4) Pass through ViT blocks
+                # Pass through ViT blocks
                 for blk in self.vit.blocks:
                     truncated_tokens = blk(truncated_tokens)
                 
                 truncated_tokens = self.vit.norm(truncated_tokens)
-                
-                # 5) The head on the CLS token => shape [1, num_classes]
                 out_i = self.vit.head(truncated_tokens[:, 0])
                 x_out_list.append(out_i)
             
-            # Concatenate the outputs => [B, num_classes]
-            logits = torch.cat(x_out_list, dim=0)
+            logits = torch.cat(x_out_list, dim=0)  # [B, num_classes]
             return logits
 
-# Same helper for visualizing
+# Visualization helper
 inv_normalize = transforms.Normalize(
     mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
     std=[1/0.229, 1/0.224, 1/0.225]
 )
-
 def visualize_masks(image, mask, patch_size=16, save_path=None):
-    """Same as before but with save_path"""
     import matplotlib.pyplot as plt
     from torchvision.transforms.functional import to_pil_image
     import numpy as np
@@ -197,7 +232,7 @@ def visualize_masks(image, mask, patch_size=16, save_path=None):
         mask_grid.unsqueeze(0).unsqueeze(0),
         size=(H, W),
         mode='nearest'
-    ).squeeze().cpu().numpy()
+    ).squeeze().detach().cpu().numpy()
     
     plt.figure(figsize=(12, 4))
     
@@ -224,58 +259,23 @@ def visualize_masks(image, mask, patch_size=16, save_path=None):
     else:
         plt.show()
 
-
 if __name__ == "__main__":
-    # Quick test
+    # Quick functionality test
     model = SparseViT(num_classes=1000)
+    dummy_input = torch.randn(2, 3, 224, 224)
     
-    # Dummy batch
-    dummy_input = torch.randn(2, 3, 224, 224)  # [batch_size, channels, height, width]
-    
-    # === Test forward pass in eval mode (inference) with actual truncation ===
     model.eval()
     with torch.no_grad():
         try:
-            output_inference = model(dummy_input)
-            print("✓ Inference (eval) forward pass successful!")
-            print("Output shape:", output_inference.shape)  # Should be [2, 1000]
+            out_eval = model(dummy_input)
+            print("✓ Eval pass shape:", out_eval.shape)
         except Exception as e:
-            print("✗ Error during inference forward pass:")
-            print(e)
+            print("Error in eval pass:", e)
     
-    # === Test training mode with soft mask application ===
     model.train()
     try:
-        output_train, masks_train = model(dummy_input)
-        print("\n✓ Training mode forward pass successful!")
-        print("Output shape:", output_train.shape)  # [2, 1000]
-        print("Masks shape:", masks_train.shape)     # [2, N, 1]
-        print("Average mask value:", masks_train.mean().item())
+        out_train, masks_train = model(dummy_input)
+        print("✓ Train pass shape:", out_train.shape)
+        print("  Masks shape:", masks_train.shape)
     except Exception as e:
-        print("\n✗ Error during training mode forward pass:")
-        print(e)
-
-    # Quick visualization test
-    dummy_batch = torch.randn(2, 3, 224, 224)
-    N = 196  # 14x14 patches for 224 image with patch_size=16
-    test_mask1 = torch.zeros(N, 1)
-    test_mask1[::2] = 1  # checkerboard
-    
-    test_mask2 = torch.zeros(N, 1)
-    test_mask2[:N//2] = 1  # top half selected
-    
-    print("Testing visualization... should see two plots")
-    visualize_masks(dummy_batch[0], test_mask1)
-    visualize_masks(dummy_batch[1], test_mask2)
-    
-    import os
-    save_dir = "viz_test"
-    os.makedirs(save_dir, exist_ok=True)
-    
-    print("\nSaving test visualizations to viz_test/...")
-    visualize_masks(dummy_batch[0], test_mask1, 
-                   save_path=os.path.join(save_dir, "test_checkerboard.png"))
-    visualize_masks(dummy_batch[1], test_mask2,
-                   save_path=os.path.join(save_dir, "test_half.png"))
-    
-    print("Done! Check the viz_test directory for saved images")
+        print("Error in train pass:", e)
